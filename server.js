@@ -1,8 +1,16 @@
 const express = require('express');
 const mongoose = require('mongoose');
+const Redis = require('async-redis');
 const cors = require('cors');
 
 const app = express();
+
+// Create a Redis client
+const redisClient = Redis.createClient(); // Use async-redis createClient()
+
+redisClient.on('error', (error) => {
+  console.error(`Redis Error: ${error}`);
+});
 
 // MongoDB configuration
 mongoose.connect('mongodb+srv://anwesha:anwesha@receipeapp.j5v9ayc.mongodb.net/', {
@@ -38,9 +46,25 @@ app.use(express.json());
 // API Routes
 // Get all recipes
 app.get('/api/recipes', async (req, res) => {
+  const cacheKey = 'recipes:all';
+
   try {
-    const recipes = await Recipe.find();
-    res.json(recipes);
+    // Check if the data is cached
+    const cachedData = await redisClient.get(cacheKey);
+
+    if (cachedData) {
+      // If cached data exists, send it as the response
+      const recipes = JSON.parse(cachedData);
+      res.json(recipes);
+    } else {
+      // If no cached data, query the MongoDB database
+      const recipes = await Recipe.find();
+
+      // Store the result in the cache for future use
+      await redisClient.setex(cacheKey, 3600, JSON.stringify(recipes)); // Cache for 1 hour
+
+      res.json(recipes);
+    }
   } catch (err) {
     res.status(500).json({ error: 'Internal Server Error' });
   }
@@ -49,16 +73,34 @@ app.get('/api/recipes', async (req, res) => {
 // Get a single recipe
 app.get('/api/recipes/:id', async (req, res) => {
   const { id } = req.params;
+  const cacheKey = `recipe:${id}`;
+
   try {
-    const recipe = await Recipe.findById(id);
-    if (!recipe) {
-      return res.status(404).json({ error: 'Recipe not found' });
+    // Check if the data is cached
+    const cachedData = await redisClient.get(cacheKey);
+
+    if (cachedData) {
+      // If cached data exists, send it as the response
+      const recipe = JSON.parse(cachedData);
+      res.json(recipe);
+    } else {
+      // If no cached data, query the MongoDB database
+      const recipe = await Recipe.findById(id);
+
+      if (!recipe) {
+        return res.status(404).json({ error: 'Recipe not found' });
+      }
+
+      // Store the result in the cache for future use
+      await redisClient.setex(cacheKey, 3600, JSON.stringify(recipe)); // Cache for 1 hour
+
+      res.json(recipe);
     }
-    res.json(recipe);
   } catch (err) {
     res.status(500).json({ error: 'Internal Server Error' });
   }
 });
+
 
 // Create a new recipe
 app.post('/api/recipes', async (req, res) => {
@@ -77,52 +119,71 @@ app.post('/api/recipes', async (req, res) => {
   }
 });
 
-// Update a recipe
-app.put('/api/recipes/:id', async (req, res) => {
+ // API Route to update a recipe
+ app.put('/api/recipes/:id', async (req, res) => {
   const { id } = req.params;
-  const { title, ingredients, instructions, type, image } = req.body;
+  const { title, ingredients, instructions, type } = req.body;
+
   try {
-    const existingRecipe = await Recipe.findById(id);
-    if (!existingRecipe) {
-      return res.status(404).json({ error: 'Recipe not found' });
-    }
-
-    // Check if the new image is provided
-    const updatedImage = image ? image : existingRecipe.image;
-    const updatedIngredients = ingredients ? ingredients : existingRecipe.ingredients;
-
-    const updatedRecipe = await Recipe.findByIdAndUpdate(
+    const existingRecipe = await Recipe.findByIdAndUpdate(
       id,
       {
         title,
-        ingredients: updatedIngredients,
+        ingredients,
         instructions,
         type,
-        image: updatedImage,
       },
       { new: true }
     );
 
-    res.json(updatedRecipe);
-  } catch (err) {
-    res.status(500).json({ error: 'Internal Server Error' });
-  }
-});
+    // If the recipe is updated, update it in the cache
+    if (existingRecipe) {
+      const cacheKey = 'recipes:all';
+      const cachedData = await redisClient.get(cacheKey);
 
-
-// Delete a recipe
-app.delete('/api/recipes/:id', async (req, res) => {
-  const { id } = req.params;
-  try {
-    const recipe = await Recipe.findByIdAndDelete(id);
-    if (!recipe) {
-      return res.status(404).json({ error: 'Recipe not found' });
+      if (cachedData) {
+        const cachedRecipes = JSON.parse(cachedData);
+        const updatedRecipes = cachedRecipes.map((recipe) =>
+          recipe._id.toString() === id ? existingRecipe : recipe
+        );
+        await redisClient.setex(cacheKey, 3600, JSON.stringify(updatedRecipes)); // Update cache
+      }
     }
-    res.json({ message: 'Recipe deleted' });
+
+    res.json(existingRecipe);
   } catch (err) {
     res.status(500).json({ error: 'Internal Server Error' });
   }
 });
+
+
+
+  // API Route to delete a recipe
+  app.delete('/api/recipes/:id', async (req, res) => {
+    const { id } = req.params;
+  
+    try {
+      const deletedRecipe = await Recipe.findByIdAndDelete(id);
+  
+      // If the recipe is deleted, remove it from the cache
+      if (deletedRecipe) {
+        const cacheKey = 'recipes:all';
+        const cachedData = await redisClient.get(cacheKey);
+  
+        if (cachedData) {
+          const cachedRecipes = JSON.parse(cachedData);
+          const updatedRecipes = cachedRecipes.filter(
+            (recipe) => recipe._id.toString() !== id
+          );
+          await redisClient.setex(cacheKey, 3600, JSON.stringify(updatedRecipes)); // Update cache
+        }
+      }
+  
+      res.json({ message: 'Recipe deleted' });
+    } catch (err) {
+      res.status(500).json({ error: 'Internal Server Error' });
+    }
+  });
 
 // Get recipes by type
 app.get('/api/recipes/type/:type', async (req, res) => {
